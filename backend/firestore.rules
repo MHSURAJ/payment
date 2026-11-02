@@ -1,0 +1,142 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    // Admin = a document exists at admins/<admin email in lowercase>
+    function isAdmin() {
+      return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.token.email));
+    }
+    // Entry fee of a match in coins (0 or missing = free)
+    function matchFee(id) {
+      return get(/databases/$(database)/documents/matches/$(id)).data.get('fee', 0);
+    }
+    // For paid matches: the SAME batch must also lower the player's wallet by exactly the fee
+    function walletOk(uid, fee) {
+      return fee == 0 || (
+        exists(/databases/$(database)/documents/wallets/$(uid))
+        && get(/databases/$(database)/documents/wallets/$(uid)).data.coins >= fee
+        && getAfter(/databases/$(database)/documents/wallets/$(uid)).data.coins == get(/databases/$(database)/documents/wallets/$(uid)).data.coins - fee);
+    }
+    function matchOpen(id) {
+      return get(/databases/$(database)/documents/matches/$(id)).data.status == 'open';
+    }
+
+    // Each user may only check whether THEIR OWN email is an admin. Created by hand in the console.
+    match /admins/{email} {
+      allow get: if signedIn() && request.auth.token.email == email;
+      allow list, write: if false;
+    }
+
+    match /matches/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /registrations/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['matchId','matchTitle','team','igl','whatsapp','discord','players','status','uid','email','fee','createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.status == 'pending'
+        && request.resource.data.team is string && request.resource.data.team.size() <= 24
+        && request.resource.data.players is list
+        && request.resource.data.players.size() >= 4 && request.resource.data.players.size() <= 5
+        && request.resource.data.fee is number
+        && request.resource.data.fee == matchFee(request.resource.data.matchId)
+        && matchOpen(request.resource.data.matchId)
+        && walletOk(request.auth.uid, request.resource.data.fee);
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow update, delete: if isAdmin();
+    }
+
+    // Room ID + password. Only admins write. A player reads it only if an admin approved them
+    // (approval creates access/<matchId>_<uid>; reject or delete removes it).
+    match /roomDetails/{matchId} {
+      allow read: if isAdmin() || (signedIn() && exists(/databases/$(database)/documents/access/$(matchId + '_' + request.auth.uid)));
+      allow write: if isAdmin();
+    }
+    match /access/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    // ---- Make my squad ----
+    match /squadPosts/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['ownerUid','ownerName','ownerDiscord','matchId','matchTitle','rank','roles','note','status','members','createdAt'])
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.ownerName.size() <= 30
+        && request.resource.data.note.size() <= 200
+        && request.resource.data.roles.size() <= 60
+        && request.resource.data.rank.size() <= 30
+        && request.resource.data.members.size() == 1
+        && request.resource.data.members[0].uid == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['ownerUid','ownerName','ownerDiscord','matchId','matchTitle','rank','roles','note','status','members','createdAt'])
+        && request.resource.data.status in ['open','full','registered']
+        && request.resource.data.members.size() >= 1 && request.resource.data.members.size() <= 4
+        && request.resource.data.members[0].uid == request.auth.uid;
+      allow delete: if signedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
+    }
+
+    // doc id = <postId>_<applicantUid>, so one application per player per squad
+    match /squadApplications/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['postId','postOwnerUid','applicantUid','name','ffUid','discord','note','status','createdAt'])
+        && request.resource.data.applicantUid == request.auth.uid
+        && id == request.resource.data.postId + '_' + request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.name.size() <= 30
+        && request.resource.data.note.size() <= 200
+        && request.resource.data.ffUid.matches('^[0-9]{8,12}$')
+        && request.resource.data.postOwnerUid != request.auth.uid
+        && get(/databases/$(database)/documents/squadPosts/$(request.resource.data.postId)).data.ownerUid == request.resource.data.postOwnerUid
+        && get(/databases/$(database)/documents/squadPosts/$(request.resource.data.postId)).data.status == 'open';
+      allow read: if signedIn() && (resource.data.applicantUid == request.auth.uid || resource.data.postOwnerUid == request.auth.uid || isAdmin());
+      allow update: if signedIn()
+        && resource.data.postOwnerUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status in ['accepted','rejected'];
+      allow delete: if signedIn() && (resource.data.applicantUid == request.auth.uid || resource.data.postOwnerUid == request.auth.uid || isAdmin());
+    }
+
+    // Coin balance: players can read their own, only admins can change it
+    match /wallets/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if isAdmin();
+      // A player can only LOWER their own coins (this is how the entry fee is charged)
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['coins'])
+        && request.resource.data.coins is number
+        && request.resource.data.coins >= 0
+        && request.resource.data.coins < resource.data.coins;
+    }
+
+    // Player profile (so admins can find a player by email to add coins)
+    match /users/{uid} {
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['email','name','photo','lastLogin'])
+        && request.resource.data.email == request.auth.token.email;
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+    }
+
+    match /uidLocks/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['regId','matchId'])
+        && matchOpen(request.resource.data.matchId);
+      allow read, update, delete: if isAdmin();
+    }
+    // REDShop generated codes. Users may read only their own code documents.
+    // Server writes use Firebase Admin and are not granted to browser clients.
+    match /codes/{codeId} {
+      allow get, list: if signedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create, update, delete: if false;
+    }
+  }
+}
